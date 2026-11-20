@@ -1,0 +1,25 @@
+def check_breach_on_load(doc, method=None):
+    cfg = _cfg(doc)
+    if not cfg:
+        return
+    p = cfg[2]
+    due = doc.get(f"custom_{p}_sla_due_date")
+    if doc.get(f"custom_{p}_sla_status") == "Running" and due and now_datetime() >= get_datetime(due):
+        doc.set(f"custom_{p}_sla_status", "Breached")
+        doc.set(f"custom_{p}_sla_remaining", 0)
+        frappe.db.set_value("Task", doc.name, {
+            f"custom_{p}_sla_status": "Breached",
+            f"custom_{p}_sla_remaining": 0,
+        }, update_modified=False)
+        sync_to_project(doc)
+
+
+def project_onload(doc, method=None):
+    for name in frappe.get_all("Task", filters={"project": doc.name}, pluck="name"):
+        check_breach_on_load(frappe.get_doc("Task", name))
+    # show the refreshed values on this form
+    for _, _, p, _ in SLA:
+        fields = [f"custom_{p}_sla_status", f"custom_{p}_sla_remaining"]
+        vals = frappe.db.get_value("Project", doc.name, fields, as_dict=True) or {}
+        for k, v in vals.items():
+            doc.set(k, v)

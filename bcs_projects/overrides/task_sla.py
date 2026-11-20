@@ -1,0 +1,371 @@
+import frappe
+from frappe.utils import now_datetime, add_to_date, get_datetime
+
+# subject key, team status field, SLA field prefix, SLA seconds
+SLA = [
+    ("technical deployment", "custom_pmo_team_deployment_status", "deployment", 3 * 24 * 3600),
+    ("invoice generation", "custom_accounts_team_status", "invoicing", 24 * 3600),
+    ("customer feedback", "custom_feedback_team_status", "feedback", 24 * 3600),
+]
+
+
+def _cfg(doc):
+    subject = (doc.subject or "").lower()
+    return next((c for c in SLA if c[0] in subject), None)
+
+
+def apply_sla(doc, method=None):
+    cfg = _cfg(doc)
+    if not cfg:
+        return
+
+    _, status_field, p, seconds = cfg
+    f = lambda x: f"custom_{p}_sla_{x}"
+    if doc.status == "Cancelled":
+            if doc.get(f("status")) == "Running":
+                due = doc.get(f("due_date"))
+                left = max(int((get_datetime(due) - now_datetime()).total_seconds()), 0) if due else 0
+                doc.set(f("remaining"), left)
+                doc.set(f("status"), "Paused")
+            return
+
+    status = doc.get(status_field)
+    sla = doc.get(f("status"))
+    if not status or sla == "Breached":      # a breach is permanent
+        return
+
+    now = now_datetime()
+    due = doc.get(f("due_date"))
+
+    # Ran out of time while Running
+    if sla == "Running" and due and now >= get_datetime(due):
+        doc.set(f("status"), "Breached")
+        doc.set(f("remaining"), 0)
+        return
+
+    if status == "In Progress":
+        if not doc.get(f("started")):                        # first start
+            doc.set(f("started"), 1)
+            doc.set(f("remaining"), seconds)
+            doc.set(f("due_date"), add_to_date(now, seconds=seconds))
+            doc.set(f("status"), "Running")
+        elif sla in ("Paused", "Fulfilled") and (doc.get(f("remaining")) or 0) > 0:   # resume
+            doc.set(f("due_date"), add_to_date(now, seconds=doc.get(f("remaining"))))
+            doc.set(f("status"), "Running")
+
+    elif sla == "Running":                                   # left In Progress
+        remaining = max(int((get_datetime(due) - now).total_seconds()), 0) if due else 0
+        doc.set(f("remaining"), remaining)
+        doc.set(f("status"), "Fulfilled" if status == "Completed" else "Paused")
+
+    elif sla == "Paused" and status == "Completed":          # completed straight from a paused state
+        doc.set(f("status"), "Fulfilled")
+
+
+def sync_to_project(doc, method=None):
+    cfg = _cfg(doc)
+    if not cfg or not doc.project:
+        return
+
+    p = cfg[2]
+    if not doc.get(f"custom_{p}_sla_started"):
+        return
+
+    # Task and Project use identical fieldnames, so values copy one-to-one
+    frappe.db.set_value("Project", doc.project, {
+        f"custom_{p}_sla_started": 1,
+        f"custom_{p}_sla_status": doc.get(f"custom_{p}_sla_status"),
+        f"custom_{p}_sla_remaining": doc.get(f"custom_{p}_sla_remaining") or 0,
+        f"custom_{p}_sla_due_date": doc.get(f"custom_{p}_sla_due_date"),
+    }, update_modified=False)
+
+
+OWNER_FIELD = {
+    "deployment": "custom_assigned_pmo",
+    "invoicing": "custom_account_owner",
+    "feedback": "custom_assigned_cet",
+}
+TEAM_LABEL = {"deployment": "Deployment", "invoicing": "Invoicing", "feedback": "Feedback"}
+
+
+def mark_breached():
+    """Scheduler job: catches breaches even when nobody has the form open."""
+    now = now_datetime()
+    for _, _, p, _ in SLA:
+        for name in frappe.get_all("Task", filters={
+            f"custom_{p}_sla_status": "Running",
+            f"custom_{p}_sla_due_date": ["<", now],
+        }, pluck="name"):
+            doc = frappe.get_doc("Task", name)
+            doc.set(f"custom_{p}_sla_status", "Breached")
+            doc.set(f"custom_{p}_sla_remaining", 0)
+            doc.flags.ignore_permissions = True
+            doc.save()          # creates the Version, so Activity shows the change
+
+    frappe.db.commit()
+
+
+def check_breach_on_load(doc, method=None):
+    cfg = _cfg(doc)
+    if not cfg:
+        return
+    p = cfg[2]
+    due = doc.get(f"custom_{p}_sla_due_date")
+    if doc.get(f"custom_{p}_sla_status") == "Running" and due and now_datetime() >= get_datetime(due):
+        doc.set(f"custom_{p}_sla_status", "Breached")
+        doc.set(f"custom_{p}_sla_remaining", 0)
+        frappe.db.set_value("Task", doc.name, {
+            f"custom_{p}_sla_status": "Breached",
+            f"custom_{p}_sla_remaining": 0,
+        }, update_modified=False)
+        sync_to_project(doc)
+
+
+def project_onload(doc, method=None):
+    for name in frappe.get_all("Task", filters={"project": doc.name}, pluck="name"):
+        check_breach_on_load(frappe.get_doc("Task", name))
+    # show the refreshed values on this form
+    for _, _, p, _ in SLA:
+        fields = [f"custom_{p}_sla_status", f"custom_{p}_sla_remaining"]
+        vals = frappe.db.get_value("Project", doc.name, fields, as_dict=True) or {}
+        for k, v in vals.items():
+            doc.set(k, v)
+
+def set_project_dates(doc, method=None):
+    subject = (doc.subject or "").lower()
+    if "technical deployment" not in subject or not doc.project:
+        return
+
+    status = doc.custom_pmo_team_deployment_status
+    today = frappe.utils.today()
+    cur = frappe.db.get_value("Project", doc.project,
+        ["custom_deployment_start_date", "custom_deployment_end_date"], as_dict=True) or {}
+
+    if status == "In Progress" and not cur.get("custom_deployment_start_date"):
+        frappe.db.set_value("Project", doc.project, "custom_deployment_start_date", today, update_modified=False)
+    if status == "Completed" and not cur.get("custom_deployment_end_date"):
+        frappe.db.set_value("Project", doc.project, "custom_deployment_end_date", today, update_modified=False)
+
+
+SO_CLOSE_STATUS = "Closed"   # confirm the value your Sales Orders use
+
+
+def complete_project_if_done(doc, method=None):
+    if not doc.project or not _cfg(doc) or doc.status != "Completed":
+        return
+    if frappe.db.get_value("Project", doc.project, "status") == "Completed":
+        return   # guard: runs once
+
+    tasks = frappe.get_all("Task",
+        filters={"project": doc.project, "status": ["!=", "Cancelled"]},
+        fields=["subject", "status"])
+
+    for key, *_ in SLA:
+        group = [t for t in tasks if key in (t.subject or "").lower()]
+        if not group or any(t.status != "Completed" for t in group):
+            return
+
+    frappe.db.set_value("Project", doc.project, "status", "Completed", update_modified=False)
+
+    for so in frappe.get_all("Sales Order",
+            filters={"project": doc.project, "status": ["!=", SO_CLOSE_STATUS]}, pluck="name"):
+        frappe.db.set_value("Sales Order", so, "status", SO_CLOSE_STATUS)
+
+    frappe.msgprint(f"Project {doc.project} marked as Completed.")
+
+# subject key -> {task field: project field}
+ASSIGNEE_MAP = {
+    "technical deployment": {
+        "custom_assigned_pmo": "custom_assigned_pmo",
+        "custom_deployment_engineer": "custom_deployment_engineer",
+    },
+    "invoice generation": {"custom_account_owner": "custom_account_owner"},
+    "customer feedback": {"custom_assigned_cet": "custom_assigned_cet"},
+}
+
+
+def sync_assignees_to_project(doc, method=None):
+    cfg = _cfg(doc)
+    if not cfg or not doc.project:
+        return
+
+    fields = ASSIGNEE_MAP.get(cfg[0], {})
+    if not fields:
+        return
+
+    current = frappe.db.get_value("Project", doc.project, list(fields.values()), as_dict=True) or {}
+    updates = {pf: doc.get(tf) for tf, pf in fields.items()
+               if doc.get(tf) and doc.get(tf) != current.get(pf)}
+
+    if updates:
+        frappe.db.set_value("Project", doc.project, updates, update_modified=False)
+
+    # Account owner picked on the Invoice task -> linked Sales Invoice
+    if cfg[0] == "invoice generation" and doc.get("custom_account_owner"):
+        si = frappe.db.get_value("Project", doc.project, "custom_sales_invoice")
+        if si and frappe.db.get_value("Sales Invoice", si, "custom_assigned_to") != doc.custom_account_owner:
+            frappe.db.set_value("Sales Invoice", si, "custom_assigned_to",
+                                doc.custom_account_owner, update_modified=False)
+
+def log_sla_status(doc, method=None):
+    """Add a comment on the Task whenever its SLA status changes."""
+    cfg = _cfg(doc)
+    if not cfg:
+        return
+
+    p = cfg[2]
+    field = f"custom_{p}_sla_status"
+    new = doc.get(field)
+
+    before = doc.get_doc_before_save()
+    old = before.get(field) if before else None
+    if not new or new == old:
+        return
+
+    owner = doc.get(OWNER_FIELD[p]) or "Unassigned"
+    change = f"{old} to {new}" if old else new
+    doc.add_comment(
+        "Info",
+        f"{TEAM_LABEL[p]} SLA {change}. Responsible: {owner}",
+    )
+
+# subject key -> {task fieldname: project fieldname}
+SECTION_MAP = {
+    "technical deployment": {f: f for f in [
+        "custom_ticket_no", "custom_deployment_location", "custom_term_of_contract_mns",
+        "custom_ram_gbtb", "custom_ssd_gbtb", "custom_configuration", "custom_no_of_users",
+        "custom_cpu_core", "custom_public_ip", "custom_access_mode", "custom_antivirus",
+        "custom_backup", "custom_file_deletion", "custom_os",
+    ]},
+    "invoice generation": {
+        "custom_sales_invoice": "custom_sales_invoice",
+        "custom_payment_frequency": "custom_payment_frequency",
+        "custom_recurring": "custom_recurring",
+    },
+    "customer feedback": {
+        "custom_customer_rating": "custom_customer_rating",
+        "custom_feedback": "custom_feedback",
+    },
+}
+
+
+def sync_sections_to_project(doc, method=None):
+    cfg = _cfg(doc)
+    if not cfg or not doc.project:
+        return
+
+    before = doc.get_doc_before_save()
+    updates = {}
+
+    for tf, pf in SECTION_MAP.get(cfg[0], {}).items():
+        val = doc.get(tf)
+        if before is None:
+            return                        # new task: never push defaults to the Project
+        if val == before.get(tf):
+            continue                      # only push what the user changed
+        updates[pf] = val
+
+    if updates:
+        frappe.db.set_value("Project", doc.project, updates, update_modified=False)
+
+TECH_FIELDS = list(SECTION_MAP["technical deployment"])
+
+
+def fill_from_project(doc, method=None):
+    """Task before_validate: new task takes the Project's values; existing task fills empty fields only."""
+    cfg = _cfg(doc)
+    if not cfg or cfg[0] != "technical deployment" or not doc.project:
+        return
+    proj = frappe.db.get_value("Project", doc.project, TECH_FIELDS, as_dict=True) or {}
+    new = doc.is_new()
+    for f in TECH_FIELDS:
+        pv = proj.get(f)
+        if pv in (None, "", 0):
+            continue
+        if new or doc.get(f) in (None, "", 0):
+            doc.set(f, pv)
+
+
+def copy_tech_on_create(doc, method=None):
+    """Task after_insert: direct DB copy so nothing can override it."""
+    cfg = _cfg(doc)
+    if not cfg or cfg[0] != "technical deployment" or not doc.project:
+        return
+    proj = frappe.db.get_value("Project", doc.project, TECH_FIELDS, as_dict=True) or {}
+    vals = {f: v for f, v in proj.items() if v not in (None, "", 0)}
+    if vals:
+        frappe.db.set_value("Task", doc.name, vals, update_modified=False)
+
+def tech_onload(doc, method=None):
+    """Task onload: show the Project's Technical values on any task that is still empty."""
+    cfg = _cfg(doc)
+    if not cfg or cfg[0] != "technical deployment" or not doc.project:
+        return
+    proj = frappe.db.get_value("Project", doc.project, TECH_FIELDS, as_dict=True) or {}
+    for f in TECH_FIELDS:
+        if doc.get(f) in (None, "", 0) and proj.get(f) not in (None, "", 0):
+            doc.set(f, proj.get(f))
+
+CUTOVER = "2026-10-27"   # ignore tasks created before the new process
+
+
+def _cancel_task(name):
+    doc = frappe.get_doc("Task", name)
+    if not _cfg(doc) or doc.status == "Cancelled":
+        return
+    doc.status = "Cancelled"                 # core field only, team status untouched
+    doc.custom_cancelled_by_project = 1
+    doc.flags.ignore_permissions = True
+    doc.save()
+
+
+def _restore_task(name):
+    doc = frappe.get_doc("Task", name)
+    cfg = _cfg(doc)
+    if not cfg:
+        return
+    p = cfg[2]
+    doc.set(cfg[1], "Yet to be Started")
+    doc.status = "Yet to be Started"
+    doc.custom_cancelled_by_project = 0
+    doc.completed_on = None
+    doc.completed_by = None
+    clear = {"started": 0, "status": "", "due_date": None, "remaining": 0}
+    for k, v in clear.items():
+        doc.set(f"custom_{p}_sla_{k}", v)
+    doc.flags.ignore_permissions = True
+    doc.save()
+    if doc.project:
+        frappe.db.set_value("Project", doc.project,
+            {f"custom_{p}_sla_{k}": v for k, v in clear.items()}, update_modified=False)
+
+
+def project_status_changed(doc, method=None):
+    """Project on_update: cascade Cancelled / back to Open to the tasks."""
+    before = doc.get_doc_before_save()
+    if before is None or before.status == doc.status:
+        return
+    if doc.status == "Cancelled":
+        for n in frappe.get_all("Task", filters={"project": doc.name, "status": ["!=", "Cancelled"]}, pluck="name"):
+            _cancel_task(n)
+    elif before.status == "Cancelled":
+        for n in frappe.get_all("Task", filters={"project": doc.name, "custom_cancelled_by_project": 1}, pluck="name"):
+            _restore_task(n)
+
+
+def reconcile_cancelled():
+    """Safety net: catches projects whose status was changed without firing the hook."""
+    to_cancel = frappe.db.sql("""select t.name from `tabTask` t join `tabProject` p on p.name = t.project
+        where p.status = 'Cancelled' and t.status != 'Cancelled' and t.creation >= %s""", CUTOVER, pluck="name")
+    to_restore = frappe.db.sql("""select t.name from `tabTask` t join `tabProject` p on p.name = t.project
+        where p.status != 'Cancelled' and t.custom_cancelled_by_project = 1""", pluck="name")
+    for n in to_cancel:
+        try:
+            _cancel_task(n)
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), f"Cancel cascade failed for {n}")
+    for n in to_restore:
+        try:
+            _restore_task(n)
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), f"Restore cascade failed for {n}")
